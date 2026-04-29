@@ -48,7 +48,19 @@
           "group": "1_modification"
         }
       ]
-    }
+    },
+    "keybindings": [
+      {
+        "command": "sqlZeroDoctrine.formatFile",
+        "key": "ctrl+shift+alt+f",
+        "when": "editorTextFocus && resourceExtension == sql"
+      },
+      {
+        "command": "sqlZeroDoctrine.formatSelection",
+        "key": "ctrl+shift+alt+g",
+        "when": "editorTextFocus && editorHasSelection && resourceExtension == sql"
+      }
+    ]
   },
   "dependencies": {
     "node-fetch": "^3.3.2"

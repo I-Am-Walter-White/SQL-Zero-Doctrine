@@ -186,12 +186,12 @@ HAVING
 
 ## RULE 9 — CASE WHEN FORMATTING
 		, (
-			CASE 
-				WHEN condition1 
-					THEN value1 
-				WHEN condition2 
-					THEN value2 
-				ELSE value3 
+			CASE
+				WHEN condition1
+					THEN value1
+				WHEN condition2
+					THEN value2
+				ELSE value3
 			END
 		) [Alias]  --  N
 
@@ -205,8 +205,8 @@ HAVING
 - Never put WHEN and THEN on the same line. Ever.
 
 ## RULE 10 — INLINE SUBQUERY IN SELECT
-		, (	
-			SELECT 	col 
+		, (
+			SELECT 	col
 			FROM 	dbo.Table [t]
 					LEFT JOIN dbo.Other [o]
 						ON t.ID = o.ID
@@ -226,6 +226,48 @@ HAVING
 - NO tab-padding between column and alias — exactly 1 space
 - NO emotional SQL`;
 
+// --- Module-level state ---
+let statusBar;
+const previewContentMap = new Map();
+const PREVIEW_SCHEME = 'sql-zero-doctrine-preview';
+const SQL_LANG_IDS = ['sql', 'SQL', 'tsql', 'mssql', 'sql-ms'];
+
+// --- Helpers ---
+function isSqlDoc(document) {
+	return SQL_LANG_IDS.includes(document.languageId) ||
+		document.fileName.toLowerCase().endsWith('.sql');
+}
+
+function getApiKey() {
+	const key = process.env.ANTHROPIC_API_KEY;
+	if (!key) vscode.window.showErrorMessage('ANTHROPIC_API_KEY not set. Set it and restart VS Code.');
+	return key;
+}
+
+function setStatus(icon, label, tooltip) {
+	if (!statusBar) return;
+	statusBar.text = `${icon} ${label}`;
+	statusBar.tooltip = tooltip;
+}
+
+function setStatusIdle() {
+	setStatus('$(database)', 'ZD', 'SQL Zero Doctrine — Click to format');
+}
+
+function setStatusFormatting() {
+	setStatus('$(sync~spin)', 'ZD', 'Zero Doctrine: formatting...');
+}
+
+function setStatusSuccess() {
+	const time = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+	setStatus('$(check)', `ZD ${time}`, `Zero Doctrine: last formatted at ${time}`);
+}
+
+function setStatusError() {
+	setStatus('$(error)', 'ZD', 'Zero Doctrine: formatting failed — click to retry');
+}
+
+// --- API ---
 async function formatSQL(sql, apiKey) {
 	const response = await fetch('https://api.anthropic.com/v1/messages', {
 		method: 'POST',
@@ -245,144 +287,205 @@ async function formatSQL(sql, apiKey) {
 	});
 
 	if (!response.ok) {
-		const err = await response.json();
-		throw new Error(err?.error?.message || `API error: ${response.status}`);
+		const err = await response.json().catch(() => ({}));
+		const error = new Error(err?.error?.message || `API error: ${response.status}`);
+		error.status = response.status;
+		throw error;
 	}
 
 	const data = await response.json();
 	return data.content?.map(b => b.text || '').join('') || '';
 }
 
-async function runFormatterForSelection(document, range) {
-	const apiKey = process.env.ANTHROPIC_API_KEY;
-	if (!apiKey) {
-		vscode.window.showErrorMessage('ANTHROPIC_API_KEY environment variable not set. Set it and restart VS Code.');
-		return [];
+// Retries once after 3s on rate-limit (429), overload (529), or server errors (5xx)
+async function formatSQLWithRetry(sql, apiKey) {
+	let lastErr;
+	for (let attempt = 0; attempt <= 1; attempt++) {
+		if (attempt > 0) await new Promise(r => setTimeout(r, 3000));
+		try {
+			return await formatSQL(sql, apiKey);
+		} catch (err) {
+			lastErr = err;
+			const retryable = err.status === 429 || err.status === 529 || err.status >= 500;
+			if (!retryable) break;
+		}
 	}
+	throw lastErr;
+}
 
-	const selectedText = document.getText(range);
-	if (!selectedText.trim()) {
-		vscode.window.showWarningMessage('No text selected. Nothing to format.');
-		return [];
-	}
+// --- Providers (Shift+Alt+F path — direct apply, no diff preview) ---
+async function runFormatter(document) {
+	const apiKey = getApiKey();
+	if (!apiKey) return [];
 
+	const fullText = document.getText();
+	if (!fullText.trim()) { vscode.window.showWarningMessage('File is empty.'); return []; }
+
+	setStatusFormatting();
 	let formatted = '';
 	await vscode.window.withProgress(
-		{
-			location: vscode.ProgressLocation.Notification,
-			title: '⚙️ Zero Doctrine: Formatting selection...',
-			cancellable: false
-		},
+		{ location: vscode.ProgressLocation.Notification, title: '⚙️ Zero Doctrine: Formatting...', cancellable: false },
 		async () => {
 			try {
-				formatted = await formatSQL(selectedText, apiKey);
+				formatted = await formatSQLWithRetry(fullText, apiKey);
 			} catch (err) {
 				vscode.window.showErrorMessage(`❌ Formatting failed: ${err.message}`);
+				setStatusError();
 			}
 		}
 	);
 
 	if (!formatted) return [];
 
+	setStatusSuccess();
+	vscode.window.showInformationMessage('✅ SQL formatted. Zero Doctrine applied.');
+	const fullRange = new vscode.Range(document.positionAt(0), document.positionAt(fullText.length));
+	return [vscode.TextEdit.replace(fullRange, formatted.trim())];
+}
+
+async function runFormatterForSelection(document, range) {
+	const apiKey = getApiKey();
+	if (!apiKey) return [];
+
+	const selectedText = document.getText(range);
+	if (!selectedText.trim()) { vscode.window.showWarningMessage('No text selected.'); return []; }
+
+	setStatusFormatting();
+	let formatted = '';
+	await vscode.window.withProgress(
+		{ location: vscode.ProgressLocation.Notification, title: '⚙️ Zero Doctrine: Formatting selection...', cancellable: false },
+		async () => {
+			try {
+				formatted = await formatSQLWithRetry(selectedText, apiKey);
+			} catch (err) {
+				vscode.window.showErrorMessage(`❌ Formatting failed: ${err.message}`);
+				setStatusError();
+			}
+		}
+	);
+
+	if (!formatted) return [];
+
+	setStatusSuccess();
 	vscode.window.showInformationMessage('✅ Selection formatted. Zero Doctrine applied.');
 	return [vscode.TextEdit.replace(range, formatted.trim())];
 }
 
-async function runFormatter(document) {
-	const apiKey = process.env.ANTHROPIC_API_KEY;
-	if (!apiKey) {
-		vscode.window.showErrorMessage('ANTHROPIC_API_KEY environment variable not set. Set it and restart VS Code.');
-		return [];
-	}
+// --- Command handler (right-click / keybinding path — shows diff preview) ---
+async function formatWithPreview(editor, sql, range) {
+	const apiKey = getApiKey();
+	if (!apiKey) return;
 
-	const fullText = document.getText();
-	if (!fullText.trim()) {
-		vscode.window.showWarningMessage('File is empty. Nothing to format.');
-		return [];
-	}
-
+	setStatusFormatting();
 	let formatted = '';
 	await vscode.window.withProgress(
-		{
-			location: vscode.ProgressLocation.Notification,
-			title: '⚙️ Zero Doctrine: Formatting your SQL...',
-			cancellable: false
-		},
+		{ location: vscode.ProgressLocation.Notification, title: '⚙️ Zero Doctrine: Formatting...', cancellable: false },
 		async () => {
 			try {
-				formatted = await formatSQL(fullText, apiKey);
+				formatted = await formatSQLWithRetry(sql, apiKey);
 			} catch (err) {
 				vscode.window.showErrorMessage(`❌ Formatting failed: ${err.message}`);
+				setStatusError();
 			}
 		}
 	);
 
-	if (!formatted) return [];
+	if (!formatted) return;
 
-	const fullRange = new vscode.Range(
-		document.positionAt(0),
-		document.positionAt(fullText.length)
+	const previewUri = vscode.Uri.parse(`${PREVIEW_SCHEME}://preview/${Date.now()}.sql`);
+	previewContentMap.set(previewUri.toString(), formatted.trim());
+
+	await vscode.commands.executeCommand(
+		'vscode.diff',
+		editor.document.uri,
+		previewUri,
+		'Zero Doctrine: Original ↔ Formatted'
 	);
 
-	vscode.window.showInformationMessage('✅ SQL formatted. Zero Doctrine applied.');
-	return [vscode.TextEdit.replace(fullRange, formatted.trim())];
+	const choice = await vscode.window.showInformationMessage(
+		'Apply Zero Doctrine formatting?',
+		'Apply',
+		'Discard'
+	);
+
+	previewContentMap.delete(previewUri.toString());
+
+	await vscode.commands.executeCommand('workbench.action.closeActiveEditor');
+	await vscode.window.showTextDocument(editor.document);
+
+	if (choice === 'Apply') {
+		const wsEdit = new vscode.WorkspaceEdit();
+		wsEdit.set(editor.document.uri, [vscode.TextEdit.replace(range, formatted.trim())]);
+		await vscode.workspace.applyEdit(wsEdit);
+		setStatusSuccess();
+		vscode.window.showInformationMessage('✅ Zero Doctrine applied.');
+	} else {
+		setStatusIdle();
+	}
 }
 
 function activate(context) {
-	// Register as a proper document formatter for all SQL language IDs
-	const sqlLangIds = ['sql', 'SQL', 'tsql', 'mssql', 'sql-ms'];
-	const formatProviders = sqlLangIds.map(langId =>
+	// Status bar item
+	statusBar = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 100);
+	statusBar.command = 'sqlZeroDoctrine.formatFile';
+	setStatusIdle();
+
+	const updateStatusVis = () => {
+		const editor = vscode.window.activeTextEditor;
+		if (editor && isSqlDoc(editor.document)) statusBar.show();
+		else statusBar.hide();
+	};
+	updateStatusVis();
+
+	// Diff preview content provider
+	const previewProvider = vscode.workspace.registerTextDocumentContentProvider(PREVIEW_SCHEME, {
+		provideTextDocumentContent(uri) {
+			return previewContentMap.get(uri.toString()) || '';
+		}
+	});
+
+	// Document formatting providers (used by Shift+Alt+F — direct apply, no diff)
+	const formatProviders = SQL_LANG_IDS.map(langId =>
 		vscode.languages.registerDocumentFormattingEditProvider(langId, {
-			provideDocumentFormattingEdits(document) {
-				return runFormatter(document);
-			}
+			provideDocumentFormattingEdits(document) { return runFormatter(document); }
 		})
 	);
-
-	// Register range formatter so the extension appears in "Format Selection With..." and "Configure Default Formatter"
-	const rangeFormatProviders = sqlLangIds.map(langId =>
+	const rangeFormatProviders = SQL_LANG_IDS.map(langId =>
 		vscode.languages.registerDocumentRangeFormattingEditProvider(langId, {
-			provideDocumentRangeFormattingEdits(document, range) {
-				return runFormatterForSelection(document, range);
-			}
+			provideDocumentRangeFormattingEdits(document, range) { return runFormatterForSelection(document, range); }
 		})
 	);
 
-	// Format Document command (right-click menu)
-	const command = vscode.commands.registerCommand('sqlZeroDoctrine.formatFile', async () => {
+	// Format Document command (right-click + Ctrl+Shift+Alt+F — with diff preview)
+	const formatCmd = vscode.commands.registerCommand('sqlZeroDoctrine.formatFile', async () => {
 		const editor = vscode.window.activeTextEditor;
-		if (!editor) {
-			vscode.window.showErrorMessage('No active editor found.');
-			return;
-		}
-		const edits = await runFormatter(editor.document);
-		if (edits.length > 0) {
-			const wsEdit = new vscode.WorkspaceEdit();
-			wsEdit.set(editor.document.uri, edits);
-			await vscode.workspace.applyEdit(wsEdit);
-		}
+		if (!editor) { vscode.window.showErrorMessage('No active editor.'); return; }
+		const fullText = editor.document.getText();
+		if (!fullText.trim()) { vscode.window.showWarningMessage('File is empty.'); return; }
+		const fullRange = new vscode.Range(
+			editor.document.positionAt(0),
+			editor.document.positionAt(fullText.length)
+		);
+		await formatWithPreview(editor, fullText, fullRange);
 	});
 
-	// Format Selection command (right-click menu)
-	const selectionCommand = vscode.commands.registerCommand('sqlZeroDoctrine.formatSelection', async () => {
+	// Format Selection command (right-click + Ctrl+Shift+Alt+G — with diff preview)
+	const selectionCmd = vscode.commands.registerCommand('sqlZeroDoctrine.formatSelection', async () => {
 		const editor = vscode.window.activeTextEditor;
-		if (!editor) {
-			vscode.window.showErrorMessage('No active editor found.');
-			return;
-		}
-		if (editor.selection.isEmpty) {
-			vscode.window.showWarningMessage('No text selected. Please select SQL to format.');
-			return;
-		}
-		const edits = await runFormatterForSelection(editor.document, editor.selection);
-		if (edits.length > 0) {
-			const wsEdit = new vscode.WorkspaceEdit();
-			wsEdit.set(editor.document.uri, edits);
-			await vscode.workspace.applyEdit(wsEdit);
-		}
+		if (!editor) { vscode.window.showErrorMessage('No active editor.'); return; }
+		if (editor.selection.isEmpty) { vscode.window.showWarningMessage('No text selected.'); return; }
+		await formatWithPreview(editor, editor.document.getText(editor.selection), editor.selection);
 	});
 
-	context.subscriptions.push(...formatProviders, ...rangeFormatProviders, command, selectionCommand);
+	context.subscriptions.push(
+		vscode.window.onDidChangeActiveTextEditor(updateStatusVis),
+		statusBar,
+		previewProvider,
+		...formatProviders,
+		...rangeFormatProviders,
+		formatCmd,
+		selectionCmd
+	);
 }
 
 function deactivate() {}

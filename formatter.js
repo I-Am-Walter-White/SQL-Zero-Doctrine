@@ -75,10 +75,6 @@ let MAX_INLINE_COL_LEN    = 80;    // configurable via formatSQL options
 let IN_LIST_BREAK_AT      = 4;     // configurable via formatSQL options
 let REORDER_JOIN_ON       = false; // if true, rewrite ON so joined table is on left side
 let STRIP_COMMENTED_CODE  = false; // if true, remove clearly commented-out SQL lines
-let _procFormatOptions    = {};    // current call options — accessible to Rule 23 section formatter
-let _rawProcBodyLines     = null;  // raw body lines for Rule 23 section detection
-let _rawSqlForR23         = '';    // raw SQL string before tokenization (for Rule 23)
-let _inR23Section         = false; // guard: prevent recursive Rule 23 triggering
 
 // ════════════════════════════════════════════════════════════════
 // RULE 22 — STRIP COMMENTED-OUT CODE
@@ -129,130 +125,243 @@ function stripCommentedCode(sql) {
 }
 
 // ════════════════════════════════════════════════════════════════
-// RULE 23 — MULTI-SELECT SECTION BLOCKS
-// Each SELECT (+ its preceding DECLARE/SET) becomes a named
-// BEGIN...END block with a -------- separator above it.
-// Existing separators preserved + normalised to 20 dashes each side.
-// Unstructured procs get Section 1, Section 2... labels.
+
+// ════════════════════════════════════════════════════════════════
+// PAREN-UNION PRE-PROCESSOR (Option A)
+// Procs that use (SELECT ... UNION SELECT ...) ORDER BY at the
+// proc body level get their UNION block extracted before tokenization,
+// normalised line-by-line (keywords uppercased, indent normalised),
+// replaced with a placeholder, then substituted back after formatting.
+// This prevents the tokenizer from collapsing multi-line UNION chains.
 // ════════════════════════════════════════════════════════════════
 
-const _SEP_DASHES = '-'.repeat(20);
-const _SEP_RE     = /^\s*(-{3,})\s*(.*?)\s*(-{3,})(.*)$/;
+// ════════════════════════════════════════════════════════════════
+// PAREN-UNION PROCESSOR — Full Zero Doctrine on each UNION branch
+//
+// Procs that use (SELECT ... UNION SELECT ...) ORDER BY at proc body
+// level are handled here:
+//   1. The entire ( ... ) block is extracted from raw SQL before tokenization
+//   2. /* ... */ block comments are stripped
+//   3. Each UNION branch is split out and fed through formatSelectStatement()
+//      — applying the full Zero Doctrine ruleset (SELECT tab alignment,
+//        column numbers, dbo. prefix, JOIN formatting, WHERE grouping, etc.)
+//   4. Branches are rejoined with blank + UNION + blank between them
+//   5. The formatted block is wrapped in ( ... ) and resubstituted into the
+//      formatted proc output at the correct indentation level
+// ════════════════════════════════════════════════════════════════
 
-function _isSepLine(line)  { return _SEP_RE.test(line.trim()); }
+const _PU_PREFIX = '__PAREN_UNION_BLOCK_';
 
-function _parseSepLine(line) {
-	const m = line.trim().match(_SEP_RE);
-	if (!m) return null;
-	return { name: m[2].trim(), trailer: (m[4] || '').trim() };
-}
-
-function _buildSepLine(name, trailer) {
-	const base = `${_SEP_DASHES} ${name} ${_SEP_DASHES}`;
-	return trailer ? `${base} ${trailer}` : base;
-}
-
-function _hasExistingSections(lines) {
-	let hasSep = false, hasBegin = false;
-	for (const l of lines) {
-		if (_isSepLine(l)) hasSep = true;
-		if (/^\s*BEGIN\s*$/i.test(l.trim())) hasBegin = true;
-		if (hasSep && hasBegin) return true;
-	}
-	return false;
-}
-
-function _countTopLevelSelects(lines) {
-	let depth = 0, count = 0;
-	for (const l of lines) {
-		const t = l.trim();
-		if      (/^BEGIN\s*$/i.test(t))             depth++;
-		else if (/^END\s*$/i.test(t))               depth--;
-		else if (depth === 0 && /^\(?\s*SELECT\b/i.test(t)) count++;
-	}
-	return count;
-}
-
-function _splitStructuredSections(lines) {
-	const sections = [];
-	let i = 0, pendingSep = null;
-	while (i < lines.length) {
-		const line = lines[i];
-		if (_isSepLine(line)) { pendingSep = _parseSepLine(line); i++; continue; }
-		if (/^\s*BEGIN\s*$/i.test(line.trim())) {
+// Count net paren depth for a line, skipping comments and string literals
+function _puParenDepth(line) {
+	let depth = 0, i = 0;
+	while (i < line.length) {
+		if (line[i] === '-' && line[i+1] === '-') break;
+		if (line[i] === '/' && line[i+1] === '*') {
+			i += 2;
+			while (i < line.length - 1 && !(line[i] === '*' && line[i+1] === '/')) i++;
+			i += 2; continue;
+		}
+		if (line[i] === "'") {
 			i++;
-			const content = [];
-			let depth = 1;
-			while (i < lines.length) {
-				const l = lines[i];
-				if (/^\s*BEGIN\s*$/i.test(l.trim())) depth++;
-				if (/^\s*END\s*$/i.test(l.trim())) { depth--; if (depth === 0) { i++; break; } }
-				content.push(l); i++;
+			while (i < line.length) {
+				if (line[i] === "'" && line[i+1] !== "'") { i++; break; }
+				if (line[i] === "'") i++;
+				i++;
 			}
-			sections.push({ sep: pendingSep, content });
-			pendingSep = null;
 			continue;
 		}
+		if (line[i] === '(') depth++;
+		else if (line[i] === ')') depth--;
 		i++;
 	}
-	return sections;
+	return depth;
 }
 
-function _splitUnstructuredSections(lines) {
-	const sections = [];
-	let i = 0, num = 1;
-	while (i < lines.length) {
-		if (!lines[i].trim()) { i++; continue; }
-		const content = [];
-		// DECLARE/SET attach to the SELECT that follows
-		while (i < lines.length && /^\s*(DECLARE|SET)\b/i.test(lines[i])) content.push(lines[i++]);
-		// Collect SELECT block until blank line, next DECLARE/SET, or proc END
-		while (i < lines.length) {
-			const t = lines[i].trim();
-			if (!t) { i++; break; }
-			if (/^END\s*$/i.test(t)) break; // stop at proc-level END
-			if (/^(DECLARE|SET)\b/i.test(t) && content.some(l => /^\s*SELECT\b/i.test(l))) break;
-			content.push(lines[i++]);
-		}
-		if (content.some(l => l.trim())) {
-			sections.push({ sep: { name: `Section ${num++}`, trailer: '' }, content });
+// Strip /* ... */ block comments from a SQL string
+function _puStripBlockComments(sql) {
+	let result = '';
+	let i = 0;
+	while (i < sql.length) {
+		if (sql[i] === "'" ) {
+			// String literal — copy verbatim
+			result += sql[i++];
+			while (i < sql.length) {
+				result += sql[i];
+				if (sql[i] === "'" && sql[i+1] !== "'") { i++; break; }
+				if (sql[i] === "'") i++;
+				i++;
+			}
+		} else if (sql[i] === '/' && sql[i+1] === '*') {
+			// Block comment — skip entirely
+			i += 2;
+			while (i < sql.length - 1 && !(sql[i] === '*' && sql[i+1] === '/')) i++;
+			i += 2;
 		} else {
-			i++; // safety: advance if nothing collected to prevent infinite loop
+			result += sql[i++];
 		}
 	}
-	return sections;
+	return result;
 }
 
-// reformatProcSections — called from formatProcStatement with raw body lines
-// formatFn(rawSql) => formattedSql
-function reformatProcSections(bodyLines, formatFn) {
-	const hasExisting = _hasExistingSections(bodyLines);
-	const selectCount = _countTopLevelSelects(bodyLines);
-	if (!hasExisting && selectCount < 2) return null; // nothing to restructure
+// Split SQL text into UNION branches at depth-0 UNION / UNION ALL
+// Returns array of { op: 'UNION'|'UNION ALL'|null, sql: string }
+function _puSplitBranches(sql) {
+	const branches = [];
+	let cur = '';
+	let depth = 0;
+	let i = 0;
 
-	const sections = hasExisting
-		? _splitStructuredSections(bodyLines)
-		: _splitUnstructuredSections(bodyLines);
+	while (i < sql.length) {
+		// String literal
+		if (sql[i] === "'") {
+			cur += sql[i++];
+			while (i < sql.length) {
+				cur += sql[i];
+				if (sql[i] === "'" && sql[i+1] !== "'") { i++; break; }
+				if (sql[i] === "'") i++;
+				i++;
+			}
+			continue;
+		}
+		// Line comment
+		if (sql[i] === '-' && sql[i+1] === '-') {
+			let j = i;
+			while (j < sql.length && sql[j] !== '\n') j++;
+			cur += sql.slice(i, j);
+			i = j;
+			continue;
+		}
+		// Parens
+		if (sql[i] === '(') { depth++; cur += sql[i++]; continue; }
+		if (sql[i] === ')') { depth--; cur += sql[i++]; continue; }
 
-	if (!sections.length) return null;
+		// UNION check at depth 0
+		if (depth === 0) {
+			const rest = sql.slice(i);
+			const unionAll = rest.match(/^UNION\s+ALL\b/i);
+			const union    = rest.match(/^UNION\b/i);
+			const op = unionAll ? 'UNION ALL' : (union ? 'UNION' : null);
+			if (op) {
+				branches.push({ op: branches.length === 0 ? null : op, sql: cur });
+				cur = '';
+				i += op.length;
+				// Skip whitespace after UNION
+				while (i < sql.length && /\s/.test(sql[i])) i++;
+				continue;
+			}
+		}
 
-	const out = [];
-	for (const { sep, content } of sections) {
-		const sepLine = _buildSepLine(sep ? sep.name : 'Section', sep ? sep.trailer : '');
-		out.push(INDENT + sepLine);
-		out.push(INDENT + 'BEGIN');
-		out.push('');
-		const raw = content.map(l => l.trim()).filter(Boolean).join('\n');
-		const fmt = formatFn(raw);
-		fmt.split('\n').forEach(l => out.push(l ? INDENT + INDENT + l : ''));
-		out.push('');
-		out.push(INDENT + 'END');
-		out.push('');
+		cur += sql[i++];
 	}
-	while (out.length && !out[out.length - 1].trim()) out.pop();
-	return out.join('\n');
+	if (cur.trim()) branches.push({ op: branches.length === 0 ? null : 'UNION', sql: cur });
+	return branches;
 }
 
+// Main pre-processor: extract ( SELECT...UNION... ) blocks before tokenization
+function _puExtractBlocks(sql) {
+	const lines  = sql.split('\n');
+	const blocks = {};
+	const result = [];
+	let i = 0, num = 0;
+
+	while (i < lines.length) {
+		const trimmed = lines[i].trim();
+
+		// Detect standalone ( line followed by SELECT within next few lines
+		if (trimmed === '(') {
+			const ahead = lines.slice(i + 1, i + 8).find(l => l.trim());
+			if (ahead && /^\s*select\b/i.test(ahead)) {
+				// Extract the entire paren block using depth-aware counting
+				let depth = 0;
+				const blockLines = [];
+				while (i < lines.length) {
+					depth += _puParenDepth(lines[i]);
+					blockLines.push(lines[i]);
+					i++;
+					if (depth === 0) break;
+				}
+
+				// Join block, strip opening ( and closing )
+				const raw = blockLines.join('\n');
+				// Strip the outer ( and ) — they're the first and last non-empty lines
+				const inner = blockLines.slice(1, -1).join('\n');
+
+				// Strip /* */ block comments
+				const stripped = _puStripBlockComments(inner);
+
+				// Store: raw block will be formatted at substitution time
+				const key = `${_PU_PREFIX}${num++}__`;
+				// We store the stripped inner SQL for later formatting
+				// and the closing paren + any trailing (ORDER BY handled by normal formatter)
+				blocks[key] = { innerSql: stripped, raw };
+				result.push(key);
+				continue;
+			}
+		}
+		result.push(lines[i]);
+		i++;
+	}
+	return { modified: result.join('\n'), blocks };
+}
+
+// Format a single UNION branch SQL string through full Zero Doctrine
+// Uses the same tokenize + formatSelectStatement pipeline as the main formatter
+function _puFormatBranch(branchSql) {
+	try {
+		// Tokenize the branch SQL
+		const toks = tokenize(branchSql);
+		if (!toks.length) return branchSql;
+		// Strip NL tokens and run through full SELECT formatter
+		return formatSelectStatement(toks.filter(t => t.t !== 'NL'), false);
+	} catch (e) {
+		return branchSql; // fallback: preserve raw if formatter fails
+	}
+}
+
+// Format a paren-UNION block: split branches, format each with Zero Doctrine, rejoin
+function _puFormatBlock(innerSql, indent) {
+	const branches = _puSplitBranches(innerSql.trim());
+	if (!branches.length) return indent + '(\n' + indent + ')';
+
+	const lines = [indent + '('];
+
+	branches.forEach(({ op, sql }, bi) => {
+		const trimmed = sql.trim();
+		if (!trimmed) return;
+
+		// Blank line + UNION separator between branches
+		if (bi > 0) {
+			lines.push('');
+			lines.push(indent + '\t' + (op || 'UNION'));
+			lines.push('');
+		}
+
+		// Format through full Zero Doctrine
+		const formatted = _puFormatBranch(trimmed);
+
+		// Indent each line one level inside the parens
+		formatted.split('\n').forEach(l => {
+			lines.push(l.trim() ? indent + '\t' + l : '');
+		});
+	});
+
+	lines.push(indent + ')');
+	return lines.join('\n');
+}
+
+// After main formatting: substitute placeholders with fully formatted blocks
+function _puResubstitute(formatted, blocks) {
+	let result = formatted;
+	for (const [key, { innerSql }] of Object.entries(blocks)) {
+		const esc = key.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+		result = result.replace(
+			new RegExp(`([ \t]*)${esc}`),
+			(_, indent) => _puFormatBlock(innerSql, indent)
+		);
+	}
+	return result;
+}
 
 function tokenize(sql) {
 	const tokens = [];
@@ -978,6 +1087,23 @@ function collectCaseBlock(tokens, idx) {
 	return i - idx;
 }
 
+
+// Returns true if the token list is a simple subquery:
+// single SELECT + single FROM (no JOINs) + optional simple WHERE, no nested subqueries.
+function _isSimpleSubquery(tokens) {
+	tokens = tokens.filter(t => t.t !== 'NL');
+	// Must have SELECT
+	if (!tokens.some(t => t.t === 'KW' && t.v === 'SELECT')) return false;
+	// Must not have any JOINs
+	if (tokens.some(t => t.t === 'KW' && t.v === 'JOIN')) return false;
+	// Must not have nested subqueries (LP followed immediately by SELECT)
+	for (let i = 0; i < tokens.length - 1; i++) {
+		if (tokens[i].t === 'LP' && tokens[i+1]?.t === 'KW' && tokens[i+1]?.v === 'SELECT') return false;
+	}
+	// Must not have UNION / INTERSECT / EXCEPT
+	if (tokens.some(t => t.t === 'KW' && ['UNION','INTERSECT','EXCEPT'].includes(t.v))) return false;
+	return true;
+}
 function formatSubqueryColumn(tokens, idx) {
 	tokens = tokens.filter(t => t.t !== 'NL');
 	const parenEnd = findMatchingParen(tokens, 0);
@@ -989,7 +1115,9 @@ function formatSubqueryColumn(tokens, idx) {
 		if (aft.length) alias = aft[aft.length - 1].v;
 	}
 	const aliasStr = alias ? bracketAlias(alias) : '';
-	const innerFormatted = formatSelectStatement(innerTokens, true);
+	const innerFormatted = _isSimpleSubquery(innerTokens)
+		? formatSelectStatementCompact(innerTokens, true)
+		: formatSelectStatement(innerTokens, true);
 	const lines = [];
 	lines.push(INDENT + INDENT + ', (');
 	innerFormatted.split('\n').forEach(l => lines.push(INDENT + INDENT + INDENT + l));
@@ -1157,7 +1285,7 @@ function isFullParenGroup(tokens) {
 }
 
 function formatConditionBlock(innerTokens, indent) {
-	const segs = splitAtTopKws(innerTokens.filter(t => t.t !== 'NL'), new Set(['AND', 'OR']))
+	const segs = splitAtTopKws(innerTokens.filter(t => t.t !== 'NL' && t.t !== 'COMMENT'), new Set(['AND', 'OR']))
 		.filter(s => s.tokens.length > 0);
 	const lines = [indent + '('];
 
@@ -1189,10 +1317,27 @@ function expandWhereSegs(validSegs) {
 		if (isFullParenGroup(gt)) {
 			const inner = gt.slice(1, -1).filter(t => t.t !== 'NL');
 			const innerSegs = splitAtTopKws(inner, new Set(['AND', 'OR'])).filter(s => s.tokens.length > 0);
-			if (innerSegs.length > 1) {
-				out.push({ kw, tokens: innerSegs[0].tokens });
-				for (let j = 1; j < innerSegs.length; j++) out.push(innerSegs[j]);
-				continue;
+
+			if (innerSegs.length === 1) {
+				// Single condition inside parens — unwrap it.
+				// (x = 1) -> x = 1, no unnecessary wrapping.
+				// Exception: keep parens if the condition itself is complex
+				// (IN subquery, EXISTS, NOT IN) — detected by having an LP inside.
+				const hasSubquery = inner.some((t, i) =>
+					t.t === 'LP' && inner[i+1]?.t === 'KW' && inner[i+1]?.v === 'SELECT');
+				if (!hasSubquery) {
+					out.push({ kw, tokens: inner });
+					continue;
+				}
+			} else if (innerSegs.length > 1) {
+				// Multiple sub-conditions — only expand if they are themselves paren groups
+				// (genuine nested grouping). (@A=1 AND @B=0) stays as one unit.
+				const hasNestedParen = innerSegs.some(s => isFullParenGroup(s.tokens));
+				if (hasNestedParen) {
+					out.push({ kw, tokens: innerSegs[0].tokens });
+					for (let j = 1; j < innerSegs.length; j++) out.push(innerSegs[j]);
+					continue;
+				}
 			}
 		}
 		out.push({ kw, tokens: gt });
@@ -1201,7 +1346,7 @@ function expandWhereSegs(validSegs) {
 }
 
 function formatWhereClause(clauseTokens) {
-	clauseTokens = clauseTokens.filter(t => t.t !== 'NL');
+	clauseTokens = clauseTokens.filter(t => t.t !== 'NL' && t.t !== 'COMMENT');
 	const raw = splitAtTopKws(clauseTokens, new Set(['AND', 'OR'])).filter(s => s.tokens.length > 0);
 	if (!raw.length) return 'WHERE';
 	const expanded = expandWhereSegs(raw);
@@ -1238,18 +1383,26 @@ function formatWhereClause(clauseTokens) {
 		});
 		lines.push(INDENT + ')');
 	} else {
-		// FIX #3 & #4: AND/OR between groups at 2 tabs, ( at 2 tabs
 		lines.push('WHERE');
 		expanded.forEach(({ kw, tokens: gt }, i) => {
-			if (i > 0) lines.push(INDENT + INDENT + kw);          // FIX #3: was INDENT + kw
 			if (isFullParenGroup(gt)) {
+				// Multi-condition paren group — AND/OR on own line, then ( ) block
+				if (i > 0) lines.push(INDENT + INDENT + kw);
 				const inner = gt.slice(1, -1).filter(t => t.t !== 'NL');
-				lines.push(...formatConditionBlock(inner, INDENT + INDENT));  // FIX #4: was INDENT
+				lines.push(...formatConditionBlock(inner, INDENT + INDENT));
 			} else {
 				const condLines = formatConditionGroup(gt);
-				lines.push(INDENT + INDENT + '(');                 // FIX #4: was INDENT + '('
-				condLines.forEach(cl => lines.push(INDENT + INDENT + INDENT + cl));
-				lines.push(INDENT + INDENT + ')');
+				if (condLines.length === 1) {
+					// Simple single-line condition — AND/OR on same line as condition
+					const prefix = i === 0 ? INDENT + INDENT : INDENT + INDENT + kw + ' ';
+					lines.push(prefix + condLines[0]);
+				} else {
+					// Multi-line condition (IN subquery, EXISTS, etc.) — AND/OR on own line, wrap in ()
+					if (i > 0) lines.push(INDENT + INDENT + kw);
+					lines.push(INDENT + INDENT + '(');
+					condLines.forEach(cl => lines.push(INDENT + INDENT + INDENT + cl));
+					lines.push(INDENT + INDENT + ')');
+				}
 			}
 		});
 	}
@@ -1273,8 +1426,8 @@ function formatConditionGroup(tokens) {
 		if (tokens[skip]?.t === 'LP') {
 			const parenEnd = findMatchingParen(tokens, skip);
 			const inner = tokens.slice(skip + 1, parenEnd);
-			const innerFmt = formatSelectStatement(inner, true);
-			return [prefix + ' (', ...innerFmt.split('\n').map(l => INDENT + l), ')'];
+			const innerFmt = formatSelectStatementCompact(inner, true);
+			return [prefix + '\t(', ...innerFmt.split('\n').map(l => INDENT + INDENT + l), ')'];
 		}
 	}
 
@@ -1295,8 +1448,8 @@ function formatConditionGroup(tokens) {
 			const inOp = isNotIn ? 'NOT IN' : 'IN';
 
 			if (listToks[0]?.t === 'KW' && listToks[0]?.v === 'SELECT') {
-				const inner = formatSelectStatement(listToks, true);
-				return [colStr + ' ' + inOp + ' (', ...inner.split('\n').map(l => INDENT + l), ')'];
+				const inner = formatSelectStatementCompact(listToks, true);
+				return [colStr + ' ' + inOp + '\t(', ...inner.split('\n').map(l => INDENT + INDENT + l), ')'];
 			}
 			const items = splitAtCommas(listToks);
 			if (items.length >= IN_LIST_BREAK_AT) {
@@ -1309,14 +1462,31 @@ function formatConditionGroup(tokens) {
 	}
 
 	// Rule 19: function call with embedded subquery in WHERE/HAVING condition
-	// formatFuncWithSubqueryArgs returns lines with built-in indentation relative to baseIndent.
-	// Return as a single "line" that the caller won't double-indent by joining with \n
-	// and wrapping in a special format the caller can detect.
-	// Simplest correct approach: use baseIndent='' so lines are unindented,
-	// the caller (formatConditionBlock / formatWhereClause) will prepend INDENT+INDENT normally.
-	// Internal structure uses INDENT for each nesting level relative to ''.
 	if (detectFuncWithSubqueryArgs(tokens)) {
 		return formatFuncWithSubqueryArgs(tokens, '', '');
+	}
+
+	// Scalar subquery comparison: expr OP (SELECT ...) — expand compactly
+	// e.g. UserID = (SELECT UserID FROM UM_tabUser WHERE UM_tabUser.Name = @User)
+	for (let si = 0; si < tokens.length - 1; si++) {
+		if (tokens[si].t === 'LP' && tokens[si + 1]?.t === 'KW' && tokens[si + 1]?.v === 'SELECT') {
+			const parenEnd = findMatchingParen(tokens, si);
+			const before = tokens.slice(0, si);
+			const inner = tokens.slice(si + 1, parenEnd);
+			const after = tokens.slice(parenEnd + 1);
+			if (before.length > 0) {
+				// Only expand if this looks like a comparison (has an OP before the ()
+				const lastBefore = before[before.length - 1];
+				// Skip — IN/NOT IN is already handled above; comparison OPs (=, <>, etc.) should expand
+				if (lastBefore.t === 'KW' && ['IN','NOT'].includes(lastBefore.v)) break;
+				const beforeStr = tokStr(before);
+				const innerFmt = formatSelectStatementCompact(inner, true);
+				const lines = [beforeStr + '\t(', ...innerFmt.split('\n').map(l => INDENT + INDENT + l), ')'];
+				if (after.length) lines[lines.length - 1] += ' ' + tokStr(after);
+				return lines;
+			}
+			break;
+		}
 	}
 
 	return [tokStr(tokens)];
@@ -1354,7 +1524,7 @@ function formatOrderByClause(clauseTokens) {
 }
 
 function formatHavingClause(clauseTokens) {
-	clauseTokens = clauseTokens.filter(t => t.t !== 'NL');
+	clauseTokens = clauseTokens.filter(t => t.t !== 'NL' && t.t !== 'COMMENT');
 	const raw = splitAtTopKws(clauseTokens, new Set(['AND', 'OR'])).filter(s => s.tokens.length > 0);
 	if (!raw.length) return 'HAVING';
 	const expanded = expandWhereSegs(raw);
@@ -2122,23 +2292,7 @@ function formatProcStatement(tokens) {
 		bodyToks.push(tok); i++;
 	}
 
-	// Rule 23: use raw body lines captured before tokenization
-	const _bodyRawLines = _rawProcBodyLines || [];
-
-	const sectioned = _inR23Section ? null : reformatProcSections(_bodyRawLines, (rawSql) => {
-		_inR23Section = true;
-		try   { return formatSQL(rawSql.trim(), _procFormatOptions); }
-		catch { return rawSql.trim(); }
-		finally { _inR23Section = false; }
-	});
-
-	if (sectioned) {
-		// Rule 23 produced section-structured output — already has correct indentation
-		sectioned.split('\n').forEach(l => lines.push(l));
-	} else {
-		// Normal single-select proc body
-		formatProcBody(bodyToks, INDENT).forEach(l => lines.push(l === '' ? '' : INDENT + l));
-	}
+	formatProcBody(bodyToks, INDENT).forEach(l => lines.push(l === '' ? '' : INDENT + l));
 	lines.push('');
 	lines.push('END');
 
@@ -2363,6 +2517,18 @@ function formatSelectStatement(tokens, noColumnNumbers) {
 	}).join('\n\n');
 }
 
+// Compact variant: clauses joined with single newline (no blank lines between).
+// Used for IN (SELECT...) / NOT IN (SELECT...) subqueries in WHERE conditions.
+function formatSelectStatementCompact(tokens, noColumnNumbers) {
+	tokens = tokens.filter(t => t.t !== 'NL' && t.t !== 'GO');
+	let clauses = splitIntoClauses(tokens);
+	clauses = mergeDeleteClauses(clauses);
+	return clauses.map(c => {
+		if (c.type === 'SELECT') return formatSelectClause(c.tokens, noColumnNumbers);
+		return formatClause(c);
+	}).join('\n');
+}
+
 function splitBatches(tokens) {
 	const batches = [];
 	let cur = [];
@@ -2407,24 +2573,12 @@ function formatBatch(tokens) {
 		const firstIdx = tokens.indexOf(firstKw);
 		const nextKw = tokens.slice(firstIdx + 1).find(t => t.t === 'KW' && (t.v === 'PROCEDURE' || t.v === 'PROC'));
 		if (nextKw) {
-			// Rule 23: extract raw body lines from the original SQL text
-			// Find body: everything after AS BEGIN ... END
-			const _asMatch = _rawSqlForR23.match(/\bAS\s*\n?\s*BEGIN\b/i);
-			const _asSimple = _rawSqlForR23.match(/\bAS\b/i);
-			const _bodyStart = _asMatch
-				? _rawSqlForR23.indexOf(_asMatch[0]) + _asMatch[0].length
-				: _asSimple
-					? _rawSqlForR23.indexOf(_asSimple[0]) + _asSimple[0].length
-					: -1;
-			if (_bodyStart >= 0) {
-				_rawProcBodyLines = _rawSqlForR23.slice(_bodyStart).split('\n').map(l => l.trim());
-			}
+
 			const leadingComments = [];
 			for (let ci = 0; ci < firstIdx; ci++) {
 				if (tokens[ci].t === 'COMMENT') leadingComments.push(tokens[ci].v);
 			}
 			const procFormatted = formatProcStatement(tokens);
-			_rawProcBodyLines = null; // reset after use
 			if (leadingComments.length) {
 				return leadingComments.join('\n') + '\n' + procFormatted;
 			}
@@ -2574,7 +2728,6 @@ function formatSQL(sql, options = {}) {
 	IN_LIST_BREAK_AT     = 4;
 	REORDER_JOIN_ON      = false;
 	STRIP_COMMENTED_CODE = false;
-	_procFormatOptions = options; // Rule 23: update module-level for section formatter
 	if (typeof options.maxInlineColLen    === 'number')  MAX_INLINE_COL_LEN   = options.maxInlineColLen;
 	if (typeof options.inListBreakAt      === 'number')  IN_LIST_BREAK_AT     = options.inListBreakAt;
 	if (typeof options.reorderJoinOn      === 'boolean') REORDER_JOIN_ON      = options.reorderJoinOn;
@@ -2582,8 +2735,13 @@ function formatSQL(sql, options = {}) {
 
 	try {
 		// Rule 22: strip commented-out code before tokenizing (opt-in)
-		const sqlToFormat = STRIP_COMMENTED_CODE ? stripCommentedCode(sql) : sql;
-		_rawSqlForR23 = sqlToFormat; // Rule 23: store raw SQL for section detection
+		let sqlToFormat = STRIP_COMMENTED_CODE ? stripCommentedCode(sql) : sql;
+
+		// Paren-UNION pre-processor: extract (SELECT...UNION...) blocks before tokenization
+		const { modified: puModified, blocks: puBlocks } = _puExtractBlocks(sqlToFormat);
+		const hasPuBlocks = Object.keys(puBlocks).length > 0;
+		if (hasPuBlocks) sqlToFormat = puModified;
+
 		const tokens = tokenize(sqlToFormat);
 		if (!tokens.length) return sql;
 
@@ -2599,7 +2757,8 @@ function formatSQL(sql, options = {}) {
 		const batches = splitBatches(workTokens);
 
 		if (batches.length <= 1) {
-			const result = formatBatch(workTokens) || sql;
+			let result = formatBatch(workTokens) || sql;
+			if (hasPuBlocks) result = _puResubstitute(result, puBlocks);
 			return options.userName
 				? applyModificationHeader(sql, result, options.userName)
 				: result;
@@ -2610,7 +2769,8 @@ function formatSQL(sql, options = {}) {
 			const result = formatBatch(batch);
 			if (result) fmtBatches.push(result);
 		}
-		const joined = fmtBatches.join('\nGO\n');
+		let joined = fmtBatches.join('\nGO\n');
+		if (hasPuBlocks) joined = _puResubstitute(joined, puBlocks);
 		return options.userName
 			? applyModificationHeader(sql, joined, options.userName)
 			: joined;

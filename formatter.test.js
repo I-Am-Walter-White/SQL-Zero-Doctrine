@@ -218,8 +218,12 @@ test('WHERE multi-group: AND/OR at 2 tabs', () => {
 });
 
 test('WHERE ( at 2 tabs per group', () => {
-	const out = formatSQL('SELECT ID FROM dbo.T WHERE (a=1) AND (b=2)');
+	// Multi-condition paren group should produce \t\t(
+	const out = formatSQL('SELECT ID FROM dbo.T WHERE (a=1 AND b=2) AND (c=3)');
 	contains(out, '\t\t(');
+	// Single-condition paren groups unwrap — no extra ()
+	const out2 = formatSQL('SELECT ID FROM dbo.T WHERE (x=1) AND (y=2)');
+	notContains(out2, '\t\t(\n\t\t\tx = 1');
 });
 
 test('IN list inline under threshold', () => {
@@ -237,7 +241,7 @@ test('IN list space preserved (not IN()', () => {
 
 test('EXISTS subquery expanded', () => {
 	const out = formatSQL('SELECT ID FROM dbo.T WHERE EXISTS (SELECT 1 FROM dbo.tabOrder WHERE tabOrder.CustID = T.ID)');
-	contains(out, 'EXISTS (');
+	contains(out, 'EXISTS\t(');
 	contains(out, 'SELECT\t1');
 });
 

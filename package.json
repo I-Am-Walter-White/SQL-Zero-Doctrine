@@ -1,6 +1,6 @@
 {
   "name": "sql-formatter",
-  "displayName": "SQL Formatter — Zero Doctrine",
+  "displayName": "SQL Formatter - Zero Doctrine",
   "description": "Formats SQL stored procedures and queries using the Zero Doctrine ruleset",
   "version": "1.0.0",
   "publisher": "Harsh",
@@ -14,6 +14,12 @@
   },
   "categories": ["Formatters"],
   "keywords": ["sql", "formatter", "zero doctrine", "stored procedure"],
+  "activationEvents": [
+      "onLanguage:sql",
+      "onLanguage:tsql",
+      "onLanguage:mssql",
+      "onLanguage:sql-ms"
+  ],
   "main": "./extension.js",
   "contributes": {
     "commands": [
@@ -26,7 +32,13 @@
         "command": "sqlZeroDoctrine.formatSelection",
         "title": "Format Selection",
         "category": "SQL Zero Doctrine"
-      }
+      },
+      {
+      "command": "sqlZeroDoctrine.reportFeedback",
+      "title": "Report Bug / Request Feature",
+      "category": "SQL Zero Doctrine",
+      "icon": "$(feedback)"
+      }      
     ],
     "menus": {
       "editor/context": [
@@ -39,7 +51,12 @@
           "command": "sqlZeroDoctrine.formatSelection",
           "when": "(resourceExtension == sql || resourceExtension == SQL) && editorHasSelection",
           "group": "1_modification"
-        }
+        },
+        {
+        "command": "sqlZeroDoctrine.reportFeedback",
+        "key": "ctrl+shift+alt+r",
+        "when": "editorTextFocus && resourceExtension == sql"
+        }        
       ]
     },
     "keybindings": [
@@ -71,7 +88,17 @@
           "type": "boolean",
           "default": false,
           "description": "When true, rewrites ON conditions so the joined table appears on the left side. Default: false"
-        }
+        },
+        "sqlZeroDoctrine.userName": {
+            "type": "string",
+            "default": "",
+            "description": "Harsh Sugandhi"
+        },
+        "sqlZeroDoctrine.stripCommentedCode": {
+            "type": "boolean",
+            "default": false,
+            "description": "When true, removes lines that are clearly commented-out SQL code (SELECT, FROM, WHERE, JOIN, etc.). Descriptive comments, change notes and section labels are always preserved."
+        }                
       }
     }
   },

@@ -1,8 +1,10 @@
 const vscode = require('vscode');
-const { formatSQL } = require('./formatter');
+const { formatSQL }      = require('./formatter');
+const { reportFeedback } = require('./feedback');
 
 // --- Module-level state ---
 let statusBar;
+let feedbackBar;
 const previewContentMap = new Map();
 const PREVIEW_SCHEME = 'sql-zero-doctrine-preview';
 const SQL_LANG_IDS = ['sql', 'SQL', 'tsql', 'mssql', 'sql-ms'];
@@ -38,11 +40,14 @@ function setStatusError() {
 
 // --- Read user config ---
 function getOptions() {
-	const config = vscode.workspace.getConfiguration('sqlZeroDoctrine');
+	const config   = vscode.workspace.getConfiguration('sqlZeroDoctrine');
+	const userName = config.get('userName', '').trim();
 	return {
-		inListBreakAt:   config.get('inListBreakAt', 4),
-		maxInlineColLen: config.get('maxInlineColLen', 80),
-		reorderJoinOn:   config.get('reorderJoinOn', false),
+		inListBreakAt:       config.get('inListBreakAt', 4),
+		maxInlineColLen:     config.get('maxInlineColLen', 80),
+		reorderJoinOn:       config.get('reorderJoinOn', false),
+		stripCommentedCode:  config.get('stripCommentedCode', false),
+		userName:            userName || undefined,  // undefined = no header added
 	};
 }
 
@@ -137,26 +142,37 @@ async function formatWithPreview(editor, sql, range) {
 }
 
 function activate(context) {
-	// Status bar item
+	// --- Format status bar ---
 	statusBar = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 100);
 	statusBar.command = 'sqlZeroDoctrine.formatFile';
 	setStatusIdle();
 
+	// --- Feedback status bar button ---
+	feedbackBar = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 99);
+	feedbackBar.text    = '$(feedback) ZD';
+	feedbackBar.tooltip = 'SQL Zero Doctrine — Report a bug or request a feature';
+	feedbackBar.command = 'sqlZeroDoctrine.reportFeedback';
+
 	const updateStatusVis = () => {
 		const editor = vscode.window.activeTextEditor;
-		if (editor && isSqlDoc(editor.document)) statusBar.show();
-		else statusBar.hide();
+		if (editor && isSqlDoc(editor.document)) {
+			statusBar.show();
+			feedbackBar.show();
+		} else {
+			statusBar.hide();
+			feedbackBar.hide();
+		}
 	};
 	updateStatusVis();
 
-	// Diff preview content provider
+	// --- Diff preview content provider ---
 	const previewProvider = vscode.workspace.registerTextDocumentContentProvider(PREVIEW_SCHEME, {
 		provideTextDocumentContent(uri) {
 			return previewContentMap.get(uri.toString()) || '';
 		}
 	});
 
-	// Document formatting providers (used by Shift+Alt+F — direct apply, no diff)
+	// --- Document formatting providers (Shift+Alt+F — direct apply, no diff) ---
 	const formatProviders = SQL_LANG_IDS.map(langId =>
 		vscode.languages.registerDocumentFormattingEditProvider(langId, {
 			provideDocumentFormattingEdits(document) { return runFormatter(document); }
@@ -168,7 +184,7 @@ function activate(context) {
 		})
 	);
 
-	// Format Document command (right-click + Ctrl+Shift+Alt+F — with diff preview)
+	// --- Format Document command (right-click + Ctrl+Shift+Alt+F — with diff preview) ---
 	const formatCmd = vscode.commands.registerCommand('sqlZeroDoctrine.formatFile', async () => {
 		const editor = vscode.window.activeTextEditor;
 		if (!editor) { vscode.window.showErrorMessage('No active editor.'); return; }
@@ -181,7 +197,7 @@ function activate(context) {
 		await formatWithPreview(editor, fullText, fullRange);
 	});
 
-	// Format Selection command (right-click + Ctrl+Shift+Alt+G — with diff preview)
+	// --- Format Selection command (right-click + Ctrl+Shift+Alt+G — with diff preview) ---
 	const selectionCmd = vscode.commands.registerCommand('sqlZeroDoctrine.formatSelection', async () => {
 		const editor = vscode.window.activeTextEditor;
 		if (!editor) { vscode.window.showErrorMessage('No active editor.'); return; }
@@ -189,14 +205,21 @@ function activate(context) {
 		await formatWithPreview(editor, editor.document.getText(editor.selection), editor.selection);
 	});
 
+	// --- Feedback command (Ctrl+Shift+Alt+R) ---
+	const feedbackCmd = vscode.commands.registerCommand('sqlZeroDoctrine.reportFeedback', async () => {
+		await reportFeedback();
+	});
+
 	context.subscriptions.push(
 		vscode.window.onDidChangeActiveTextEditor(updateStatusVis),
 		statusBar,
+		feedbackBar,
 		previewProvider,
 		...formatProviders,
 		...rangeFormatProviders,
 		formatCmd,
-		selectionCmd
+		selectionCmd,
+		feedbackCmd,
 	);
 }
 

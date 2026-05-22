@@ -74,6 +74,185 @@ const LONG_COL_KWS = new Set([
 let MAX_INLINE_COL_LEN    = 80;    // configurable via formatSQL options
 let IN_LIST_BREAK_AT      = 4;     // configurable via formatSQL options
 let REORDER_JOIN_ON       = false; // if true, rewrite ON so joined table is on left side
+let STRIP_COMMENTED_CODE  = false; // if true, remove clearly commented-out SQL lines
+let _procFormatOptions    = {};    // current call options — accessible to Rule 23 section formatter
+let _rawProcBodyLines     = null;  // raw body lines for Rule 23 section detection
+let _rawSqlForR23         = '';    // raw SQL string before tokenization (for Rule 23)
+let _inR23Section         = false; // guard: prevent recursive Rule 23 triggering
+
+// ════════════════════════════════════════════════════════════════
+// RULE 22 — STRIP COMMENTED-OUT CODE
+// Removes lines that are clearly commented-out SQL statements.
+// Keeps descriptive comments, change notes, section labels etc.
+// Only fires when options.stripCommentedCode === true (opt-in).
+// ════════════════════════════════════════════════════════════════
+
+const _COMMENTED_CODE_PATTERNS = [
+	/^--\s*SELECT\b/i,
+	/^--\s*FROM\b/i,
+	/^--\s*WHERE\b/i,
+	/^--\s*INNER\s+JOIN\b/i,
+	/^--\s*LEFT\s+JOIN\b/i,
+	/^--\s*RIGHT\s+JOIN\b/i,
+	/^--\s*FULL\s+JOIN\b/i,
+	/^--\s*CROSS\s+JOIN\b/i,
+	/^--\s*JOIN\b/i,
+	/^--\s*AND\s+\S/i,
+	/^--\s*OR\s+\S/i,
+	/^--\s*ON\s+\w+\.\w+/i,
+	/^--\s*ORDER\s+BY\b/i,
+	/^--\s*GROUP\s+BY\b/i,
+	/^--\s*HAVING\b/i,
+	/^--\s*INSERT\s+INTO\b/i,
+	/^--\s*UPDATE\s+\w+\s+SET\b/i,
+	/^--\s*DELETE\s+FROM\b/i,
+	/^--\s*DECLARE\s+@/i,
+	/^--\s*SET\s+@/i,
+	/^--\s*EXEC\s+\w/i,
+	/^--\s*IF\s+(@|\(|\w+\.)/i,
+	/^--\s*BEGIN\s*$/i,
+	/^--\s*END\s*$/i,
+	/^--\s*RETURN\s*$/i,
+	/^--\s*,\s*\w+\.\w+/i,
+	/^--\s*,\s*\(/i,
+];
+
+function _isCommentedCode(line) {
+	return _COMMENTED_CODE_PATTERNS.some(p => p.test(line.trim()));
+}
+
+function stripCommentedCode(sql) {
+	return sql
+		.split('\n')
+		.filter(line => !_isCommentedCode(line))
+		.join('\n');
+}
+
+// ════════════════════════════════════════════════════════════════
+// RULE 23 — MULTI-SELECT SECTION BLOCKS
+// Each SELECT (+ its preceding DECLARE/SET) becomes a named
+// BEGIN...END block with a -------- separator above it.
+// Existing separators preserved + normalised to 20 dashes each side.
+// Unstructured procs get Section 1, Section 2... labels.
+// ════════════════════════════════════════════════════════════════
+
+const _SEP_DASHES = '-'.repeat(20);
+const _SEP_RE     = /^\s*(-{3,})\s*(.*?)\s*(-{3,})(.*)$/;
+
+function _isSepLine(line)  { return _SEP_RE.test(line.trim()); }
+
+function _parseSepLine(line) {
+	const m = line.trim().match(_SEP_RE);
+	if (!m) return null;
+	return { name: m[2].trim(), trailer: (m[4] || '').trim() };
+}
+
+function _buildSepLine(name, trailer) {
+	const base = `${_SEP_DASHES} ${name} ${_SEP_DASHES}`;
+	return trailer ? `${base} ${trailer}` : base;
+}
+
+function _hasExistingSections(lines) {
+	let hasSep = false, hasBegin = false;
+	for (const l of lines) {
+		if (_isSepLine(l)) hasSep = true;
+		if (/^\s*BEGIN\s*$/i.test(l.trim())) hasBegin = true;
+		if (hasSep && hasBegin) return true;
+	}
+	return false;
+}
+
+function _countTopLevelSelects(lines) {
+	let depth = 0, count = 0;
+	for (const l of lines) {
+		const t = l.trim();
+		if      (/^BEGIN\s*$/i.test(t))             depth++;
+		else if (/^END\s*$/i.test(t))               depth--;
+		else if (depth === 0 && /^\(?\s*SELECT\b/i.test(t)) count++;
+	}
+	return count;
+}
+
+function _splitStructuredSections(lines) {
+	const sections = [];
+	let i = 0, pendingSep = null;
+	while (i < lines.length) {
+		const line = lines[i];
+		if (_isSepLine(line)) { pendingSep = _parseSepLine(line); i++; continue; }
+		if (/^\s*BEGIN\s*$/i.test(line.trim())) {
+			i++;
+			const content = [];
+			let depth = 1;
+			while (i < lines.length) {
+				const l = lines[i];
+				if (/^\s*BEGIN\s*$/i.test(l.trim())) depth++;
+				if (/^\s*END\s*$/i.test(l.trim())) { depth--; if (depth === 0) { i++; break; } }
+				content.push(l); i++;
+			}
+			sections.push({ sep: pendingSep, content });
+			pendingSep = null;
+			continue;
+		}
+		i++;
+	}
+	return sections;
+}
+
+function _splitUnstructuredSections(lines) {
+	const sections = [];
+	let i = 0, num = 1;
+	while (i < lines.length) {
+		if (!lines[i].trim()) { i++; continue; }
+		const content = [];
+		// DECLARE/SET attach to the SELECT that follows
+		while (i < lines.length && /^\s*(DECLARE|SET)\b/i.test(lines[i])) content.push(lines[i++]);
+		// Collect SELECT block until blank line, next DECLARE/SET, or proc END
+		while (i < lines.length) {
+			const t = lines[i].trim();
+			if (!t) { i++; break; }
+			if (/^END\s*$/i.test(t)) break; // stop at proc-level END
+			if (/^(DECLARE|SET)\b/i.test(t) && content.some(l => /^\s*SELECT\b/i.test(l))) break;
+			content.push(lines[i++]);
+		}
+		if (content.some(l => l.trim())) {
+			sections.push({ sep: { name: `Section ${num++}`, trailer: '' }, content });
+		} else {
+			i++; // safety: advance if nothing collected to prevent infinite loop
+		}
+	}
+	return sections;
+}
+
+// reformatProcSections — called from formatProcStatement with raw body lines
+// formatFn(rawSql) => formattedSql
+function reformatProcSections(bodyLines, formatFn) {
+	const hasExisting = _hasExistingSections(bodyLines);
+	const selectCount = _countTopLevelSelects(bodyLines);
+	if (!hasExisting && selectCount < 2) return null; // nothing to restructure
+
+	const sections = hasExisting
+		? _splitStructuredSections(bodyLines)
+		: _splitUnstructuredSections(bodyLines);
+
+	if (!sections.length) return null;
+
+	const out = [];
+	for (const { sep, content } of sections) {
+		const sepLine = _buildSepLine(sep ? sep.name : 'Section', sep ? sep.trailer : '');
+		out.push(INDENT + sepLine);
+		out.push(INDENT + 'BEGIN');
+		out.push('');
+		const raw = content.map(l => l.trim()).filter(Boolean).join('\n');
+		const fmt = formatFn(raw);
+		fmt.split('\n').forEach(l => out.push(l ? INDENT + INDENT + l : ''));
+		out.push('');
+		out.push(INDENT + 'END');
+		out.push('');
+	}
+	while (out.length && !out[out.length - 1].trim()) out.pop();
+	return out.join('\n');
+}
+
 
 function tokenize(sql) {
 	const tokens = [];
@@ -1943,7 +2122,23 @@ function formatProcStatement(tokens) {
 		bodyToks.push(tok); i++;
 	}
 
-	formatProcBody(bodyToks, INDENT).forEach(l => lines.push(l === '' ? '' : INDENT + l));
+	// Rule 23: use raw body lines captured before tokenization
+	const _bodyRawLines = _rawProcBodyLines || [];
+
+	const sectioned = _inR23Section ? null : reformatProcSections(_bodyRawLines, (rawSql) => {
+		_inR23Section = true;
+		try   { return formatSQL(rawSql.trim(), _procFormatOptions); }
+		catch { return rawSql.trim(); }
+		finally { _inR23Section = false; }
+	});
+
+	if (sectioned) {
+		// Rule 23 produced section-structured output — already has correct indentation
+		sectioned.split('\n').forEach(l => lines.push(l));
+	} else {
+		// Normal single-select proc body
+		formatProcBody(bodyToks, INDENT).forEach(l => lines.push(l === '' ? '' : INDENT + l));
+	}
 	lines.push('');
 	lines.push('END');
 
@@ -2212,11 +2407,24 @@ function formatBatch(tokens) {
 		const firstIdx = tokens.indexOf(firstKw);
 		const nextKw = tokens.slice(firstIdx + 1).find(t => t.t === 'KW' && (t.v === 'PROCEDURE' || t.v === 'PROC'));
 		if (nextKw) {
+			// Rule 23: extract raw body lines from the original SQL text
+			// Find body: everything after AS BEGIN ... END
+			const _asMatch = _rawSqlForR23.match(/\bAS\s*\n?\s*BEGIN\b/i);
+			const _asSimple = _rawSqlForR23.match(/\bAS\b/i);
+			const _bodyStart = _asMatch
+				? _rawSqlForR23.indexOf(_asMatch[0]) + _asMatch[0].length
+				: _asSimple
+					? _rawSqlForR23.indexOf(_asSimple[0]) + _asSimple[0].length
+					: -1;
+			if (_bodyStart >= 0) {
+				_rawProcBodyLines = _rawSqlForR23.slice(_bodyStart).split('\n').map(l => l.trim());
+			}
 			const leadingComments = [];
 			for (let ci = 0; ci < firstIdx; ci++) {
 				if (tokens[ci].t === 'COMMENT') leadingComments.push(tokens[ci].v);
 			}
 			const procFormatted = formatProcStatement(tokens);
+			_rawProcBodyLines = null; // reset after use
 			if (leadingComments.length) {
 				return leadingComments.join('\n') + '\n' + procFormatted;
 			}
@@ -2251,17 +2459,132 @@ function formatBatch(tokens) {
 	return formatSelectStatement(tokens, false);
 }
 
+
+// ════════════════════════════════════════════════════════════════
+// RULE 21 — MODIFICATION HEADER
+// Wraps/adds a --****... block at the top of the file with
+// the original creation comments preserved and a "Modified by"
+// line appended showing the current user + today's date.
+// All key: value pairs are tab-aligned so values line up.
+// ════════════════════════════════════════════════════════════════
+
+const HEADER_BORDER = '--' + '*'.repeat(51);
+
+function _ordinalDate(date) {
+	const d   = date.getDate();
+	const mon = date.toLocaleString('en-GB', { month: 'long' });
+	const yr  = date.getFullYear();
+	const sfx = (d === 1 || d === 21 || d === 31) ? 'st'
+	          : (d === 2 || d === 22)              ? 'nd'
+	          : (d === 3 || d === 23)              ? 'rd'
+	          : 'th';
+	return `${d}${sfx} ${mon} ${yr}`;
+}
+
+function _isPreamble(line) {
+	return /^\s*(SET\s+ANSI_NULLS|SET\s+QUOTED_IDENTIFIER|GO)\b/i.test(line)
+	    || /^\s*$/.test(line);
+}
+
+function _isBorder(line)     { return /^\s*--\*{3,}/.test(line); }
+function _isComment(line)    { return /^\s*--/.test(line); }
+function _isModifiedBy(line) { return /^\s*--\s*Modified by:/i.test(line); }
+
+// Parse a comment line into { key, value } or { raw } if no colon
+function _parseCommentLine(line) {
+	const text     = line.replace(/^\s*--\s*/, '');
+	const colonIdx = text.indexOf(':');
+	if (colonIdx > 0) {
+		return { key: text.slice(0, colonIdx).trimEnd(), value: text.slice(colonIdx + 1).trimStart() };
+	}
+	return { raw: text };
+}
+
+// Build tab-aligned header lines — all values start at the same tab stop
+function _buildAlignedHeader(commentLines, userName, dateStr) {
+	const parsed = commentLines.map(_parseCommentLine);
+	parsed.push({ key: 'Modified by', value: `${userName} on ${dateStr} for Formatting` });
+
+	const keyedItems   = parsed.filter(p => p.key !== undefined);
+	const maxKeyLen    = keyedItems.reduce((m, p) => Math.max(m, p.key.length), 0);
+	const maxPrefixLen = maxKeyLen + 4; // "-- " (3) + key + ":"
+	// Nearest tab stop past maxPrefixLen — ensures at least 1 char gap
+	const targetStop   = Math.ceil((maxPrefixLen + 1) / 4) * 4;
+
+	const lines = [HEADER_BORDER];
+	for (const p of parsed) {
+		if (p.raw !== undefined) {
+			// No colon — keep as-is with normalised "-- " prefix
+			lines.push('-- ' + p.raw);
+		} else {
+			const prefix = '-- ' + p.key + ':';
+			let col = prefix.length, tabs = '';
+			do { tabs += '\t'; col = Math.ceil((col + 1) / 4) * 4; } while (col < targetStop);
+			lines.push(prefix + tabs + p.value);
+		}
+	}
+	lines.push(HEADER_BORDER);
+	return lines.join('\n');
+}
+
+function _extractHeader(sql) {
+	const lines = sql.split('\n');
+	const preamble = [], existing = [];
+	let i = 0;
+
+	// Phase 1 — skip SET ANSI/QUOTED + GO preamble
+	while (i < lines.length && _isPreamble(lines[i])) preamble.push(lines[i++]);
+
+	// Phase 2 — collect original header comments
+	// Skip border lines and skip any pre-existing "Modified by" line (we'll replace it)
+	while (i < lines.length) {
+		const line = lines[i];
+		if (/^\s*$/.test(line))  { i++; continue; }  // blank — skip
+		if (_isBorder(line))     { i++; continue; }  // existing border — skip
+		if (_isComment(line)) {
+			if (!_isModifiedBy(line)) existing.push(line.trimEnd());
+			i++;
+		} else {
+			break; // hit real SQL
+		}
+	}
+
+	return { preamble, existing, rest: lines.slice(i).join('\n') };
+}
+
+function applyModificationHeader(originalSql, formattedSql, userName) {
+	// Extract header comments from ORIGINAL sql (before tokenizer strips newlines)
+	const { preamble, existing } = _extractHeader(originalSql);
+	const dateStr = _ordinalDate(new Date());
+	const header  = _buildAlignedHeader(existing, userName, dateStr);
+
+	// Strip any existing header block from formatted output to avoid duplication
+	const { rest: formattedBody } = _extractHeader(formattedSql);
+
+	const parts = [];
+	if (preamble.length) parts.push(preamble.join('\n').trimEnd());
+	parts.push(header);
+	parts.push(formattedBody.trimStart());
+	return parts.join('\n\n');
+}
+
 function formatSQL(sql, options = {}) {
 	// Reset to defaults then apply per-call options (prevents mutation bleed between calls)
-	MAX_INLINE_COL_LEN = 80;
-	IN_LIST_BREAK_AT   = 4;
-	REORDER_JOIN_ON    = false;
-	if (typeof options.maxInlineColLen === 'number')  MAX_INLINE_COL_LEN = options.maxInlineColLen;
-	if (typeof options.inListBreakAt   === 'number')  IN_LIST_BREAK_AT   = options.inListBreakAt;
-	if (typeof options.reorderJoinOn   === 'boolean') REORDER_JOIN_ON    = options.reorderJoinOn;
+	MAX_INLINE_COL_LEN   = 80;
+	IN_LIST_BREAK_AT     = 4;
+	REORDER_JOIN_ON      = false;
+	STRIP_COMMENTED_CODE = false;
+	_procFormatOptions = options; // Rule 23: update module-level for section formatter
+	if (typeof options.maxInlineColLen    === 'number')  MAX_INLINE_COL_LEN   = options.maxInlineColLen;
+	if (typeof options.inListBreakAt      === 'number')  IN_LIST_BREAK_AT     = options.inListBreakAt;
+	if (typeof options.reorderJoinOn      === 'boolean') REORDER_JOIN_ON      = options.reorderJoinOn;
+	if (typeof options.stripCommentedCode === 'boolean') STRIP_COMMENTED_CODE = options.stripCommentedCode;
 
 	try {
-		const tokens = tokenize(sql);
+		// Rule 22: strip commented-out code before tokenizing (opt-in)
+		const sqlToFormat = STRIP_COMMENTED_CODE ? stripCommentedCode(sql) : sql;
+		_rawSqlForR23 = sqlToFormat; // Rule 23: store raw SQL for section detection
+		const tokens = tokenize(sqlToFormat);
 		if (!tokens.length) return sql;
 
 		let workTokens = tokens;
@@ -2276,16 +2599,21 @@ function formatSQL(sql, options = {}) {
 		const batches = splitBatches(workTokens);
 
 		if (batches.length <= 1) {
-			const result = formatBatch(workTokens);
-			return result || sql;
+			const result = formatBatch(workTokens) || sql;
+			return options.userName
+				? applyModificationHeader(sql, result, options.userName)
+				: result;
 		}
 
-		const formatted = [];
+		const fmtBatches = [];
 		for (const batch of batches) {
 			const result = formatBatch(batch);
-			if (result) formatted.push(result);
+			if (result) fmtBatches.push(result);
 		}
-		return formatted.join('\nGO\n');
+		const joined = fmtBatches.join('\nGO\n');
+		return options.userName
+			? applyModificationHeader(sql, joined, options.userName)
+			: joined;
 
 	} catch (err) {
 		// Missing 5: re-throw so extension.js can show the actual error message
@@ -2294,4 +2622,4 @@ function formatSQL(sql, options = {}) {
 	}
 }
 
-module.exports = { formatSQL };
+module.exports = { formatSQL, applyModificationHeader };
